@@ -11,7 +11,7 @@ Spotify プレイリスト更新スクリプトです。
 ## 📦 依存関係
 
 ```sh
-pip install spotipy python-dotenv
+pip install spotipy python-dotenv requests
 ```
 
 ## ⚙ 環境設定
@@ -53,6 +53,19 @@ cp .env.example .env
 - 1 日あたり **MIN_TRACKS–MAX_TRACKS** 曲をランダム選出
 - 同一アーティスト連続を避ける簡易ルール
 - プレイリストを上書き更新し、履歴を `history.json` に保存
+
+
+## ✅ 動作確認手順（Dev Mode対応後）
+
+トークンキャッシュを一度削除して再認可し、更新処理が通ることを確認します。
+
+```sh
+rm -f .cache
+python3 morning_playlist_update.py
+```
+
+- 初回はブラウザ認可が開きます。
+- 実行後に `morning_playlist_update.log` にエラーがなく、対象プレイリストが更新されていればOKです。
 
 ## ⏰ macOS での自動実行 (`launchd`)
 
