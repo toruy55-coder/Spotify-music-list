@@ -27,6 +27,9 @@ import sys
 import time
 from datetime import date, datetime, timedelta
 
+import urllib.error
+import urllib.request
+
 import spotipy
 from spotipy.oauth2 import SpotifyOAuth
 from dotenv import load_dotenv
@@ -43,6 +46,8 @@ MAX_POPULARITY = 60  # prefer less popular
 MAX_TEMPO = 120
 MAX_ENERGY = 0.6
 LOG_FILE = "morning_playlist_update.log"
+SEARCH_LIMIT = 10
+SEARCH_OFFSETS = (0, 10, 20)
 
 # ---- utility routines -------------------------------------------------------
 
@@ -138,9 +143,59 @@ def spotify_retry(func, *args, **kwargs):
             continue
     raise RuntimeError("spotify request failed after retries")
 
+
+def spotify_api_request(auth_manager, method, path, json_body=None):
+    """Call Spotify Web API directly with bearer token + retry for 401/429/5xx."""
+    url = f"https://api.spotify.com{path}"
+    for attempt in range(5):
+        token = auth_manager.get_access_token(as_dict=False)
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+        }
+        body = None if json_body is None else json.dumps(json_body).encode("utf-8")
+        req = urllib.request.Request(url, data=body, headers=headers, method=method)
+
+        try:
+            with urllib.request.urlopen(req, timeout=20) as resp:
+                status_code = resp.getcode()
+                resp_headers = resp.headers
+                resp_text = resp.read().decode("utf-8")
+        except urllib.error.HTTPError as e:
+            status_code = e.code
+            resp_headers = e.headers
+            resp_text = e.read().decode("utf-8")
+        except urllib.error.URLError as e:
+            logger.warning("spotify api request error %s, attempt %d", e, attempt + 1)
+            time.sleep(2)
+            continue
+
+        if status_code == 429:
+            retry = int(resp_headers.get("Retry-After", "5"))
+            logger.warning("Rate limited, sleeping for %s seconds", retry)
+            time.sleep(retry + 1)
+            continue
+        if status_code == 401:
+            logger.info("Received 401, refreshing token and retrying")
+            # get_access_token will refresh on next iteration as needed
+            time.sleep(1)
+            continue
+        if status_code >= 500:
+            logger.warning("spotify server error %s, attempt %d", status_code, attempt + 1)
+            time.sleep(2)
+            continue
+        if status_code >= 400:
+            raise RuntimeError(f"Spotify API {method} {path} failed: {status_code} {resp_text}")
+
+        if status_code == 204 or not resp_text:
+            return None
+        return json.loads(resp_text)
+
+    raise RuntimeError(f"Spotify API {method} {path} failed after retries")
+
 # ---- playlist & search logic ------------------------------------------------
 
-def ensure_playlist(sp, user_id, name):
+def ensure_playlist(sp, auth_manager, name):
     # search user's playlists
     limit = 50
     offset = 0
@@ -155,7 +210,16 @@ def ensure_playlist(sp, user_id, name):
             continue
         break
     logger.info("Creating new playlist %s", name)
-    p = spotify_retry(sp.user_playlist_create, user_id, name, public=False, description="Automated morning picks")
+    p = spotify_api_request(
+        auth_manager,
+        "POST",
+        "/v1/me/playlists",
+        json_body={
+            "name": name,
+            "public": False,
+            "description": "Automated morning picks",
+        },
+    )
     return p["id"]
 
 
@@ -164,24 +228,52 @@ def gather_candidates(sp):
     seen = set()
     for genre in GENRES:
         q = f'genre:"{genre}"'
-        res = spotify_retry(sp.search, q=q, type="track", market=MARKET, limit=50)
-        for item in res.get("tracks", {}).get("items", []):
-            tid = item["id"]
-            if tid in seen:
-                continue
-            seen.add(tid)
-            tracks.append(item)
+        for offset in SEARCH_OFFSETS:
+            res = spotify_retry(
+                sp.search,
+                q=q,
+                type="track",
+                market=MARKET,
+                limit=SEARCH_LIMIT,
+                offset=offset,
+            )
+            for item in res.get("tracks", {}).get("items", []):
+                tid = item["id"]
+                if tid in seen:
+                    continue
+                seen.add(tid)
+                tracks.append(item)
     return tracks
 
 
-def filter_candidates(sp, candidates):
+def filter_candidates(sp, auth_manager, candidates):
     # remove too popular and enforce audio features
     ids = [t["id"] for t in candidates]
     features = []
+    audio_features_forbidden = False
+
     for i in range(0, len(ids), 50):
         batch = ids[i : i + 50]
-        f = spotify_retry(sp.audio_features, batch)
-        features.extend(f)
+        try:
+            res = spotify_api_request(
+                auth_manager,
+                "GET",
+                f"/v1/audio-features?ids={','.join(batch)}",
+            )
+            features.extend(res.get("audio_features", []))
+        except RuntimeError as e:
+            if " 403 " in str(e):
+                audio_features_forbidden = True
+                logger.warning(
+                    "audio-features endpoint returned 403 in this Spotify Dev Mode app; "
+                    "falling back to popularity-only filtering"
+                )
+                break
+            raise
+
+    if audio_features_forbidden:
+        return [t for t in candidates if t.get("popularity", 0) <= MAX_POPULARITY]
+
     filtered = []
     for track, feat in zip(candidates, features):
         if feat is None:
@@ -227,17 +319,16 @@ def main():
     sp = spotipy.Spotify(auth_manager=auth)
 
     try:
-        user = spotify_retry(sp.current_user)
+        spotify_retry(sp.current_user)
     except Exception as e:
         logger.error("unable to get current user: %s", e)
         sys.exit(1)
-    uid = user["id"]
 
-    playlist_id = ensure_playlist(sp, uid, args.playlist_name)
+    playlist_id = ensure_playlist(sp, auth, args.playlist_name)
 
     candidates = gather_candidates(sp)
     logger.info("found %d raw candidate tracks", len(candidates))
-    candidates = filter_candidates(sp, candidates)
+    candidates = filter_candidates(sp, auth, candidates)
     logger.info("after audio/popularity filtering: %d", len(candidates))
 
     # history
@@ -260,7 +351,12 @@ def main():
     uris = [t["uri"] for t in selected]
     logger.info("updating playlist with %d tracks", len(uris))
     try:
-        spotify_retry(sp.playlist_replace_items, playlist_id, uris)
+        spotify_api_request(
+            auth,
+            "PUT",
+            f"/v1/playlists/{playlist_id}/items",
+            json_body={"uris": uris},
+        )
     except Exception as e:
         logger.error("failed to update playlist: %s", e)
         sys.exit(3)
