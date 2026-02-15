@@ -49,6 +49,7 @@ cp .env.example .env
 
 - ジャンル `indie pop`、`chill pop`、`dream pop` の曲を検索
 - 人気度が低め、テンポ/エネルギーも控えめな曲を優先
+- Spotify Dev Mode で `audio-features` が 403 の場合は、人気度フィルタのみで継続（処理は停止しません）
 - 直近 **DAYS_HISTORY** 日に登場した曲は除外
 - 1 日あたり **MIN_TRACKS–MAX_TRACKS** 曲をランダム選出
 - 同一アーティスト連続を避ける簡易ルール

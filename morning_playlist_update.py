@@ -27,7 +27,9 @@ import sys
 import time
 from datetime import date, datetime, timedelta
 
-import requests
+import urllib.error
+import urllib.request
+
 import spotipy
 from spotipy.oauth2 import SpotifyOAuth
 from dotenv import load_dotenv
@@ -151,33 +153,43 @@ def spotify_api_request(auth_manager, method, path, json_body=None):
             "Authorization": f"Bearer {token}",
             "Content-Type": "application/json",
         }
+        body = None if json_body is None else json.dumps(json_body).encode("utf-8")
+        req = urllib.request.Request(url, data=body, headers=headers, method=method)
+
         try:
-            resp = requests.request(method, url, headers=headers, json=json_body, timeout=20)
-        except requests.RequestException as e:
+            with urllib.request.urlopen(req, timeout=20) as resp:
+                status_code = resp.getcode()
+                resp_headers = resp.headers
+                resp_text = resp.read().decode("utf-8")
+        except urllib.error.HTTPError as e:
+            status_code = e.code
+            resp_headers = e.headers
+            resp_text = e.read().decode("utf-8")
+        except urllib.error.URLError as e:
             logger.warning("spotify api request error %s, attempt %d", e, attempt + 1)
             time.sleep(2)
             continue
 
-        if resp.status_code == 429:
-            retry = int(resp.headers.get("Retry-After", "5"))
+        if status_code == 429:
+            retry = int(resp_headers.get("Retry-After", "5"))
             logger.warning("Rate limited, sleeping for %s seconds", retry)
             time.sleep(retry + 1)
             continue
-        if resp.status_code == 401:
+        if status_code == 401:
             logger.info("Received 401, refreshing token and retrying")
             # get_access_token will refresh on next iteration as needed
             time.sleep(1)
             continue
-        if resp.status_code >= 500:
-            logger.warning("spotify server error %s, attempt %d", resp.status_code, attempt + 1)
+        if status_code >= 500:
+            logger.warning("spotify server error %s, attempt %d", status_code, attempt + 1)
             time.sleep(2)
             continue
-        if resp.status_code >= 400:
-            raise RuntimeError(f"Spotify API {method} {path} failed: {resp.status_code} {resp.text}")
+        if status_code >= 400:
+            raise RuntimeError(f"Spotify API {method} {path} failed: {status_code} {resp_text}")
 
-        if resp.status_code == 204 or not resp.text:
+        if status_code == 204 or not resp_text:
             return None
-        return resp.json()
+        return json.loads(resp_text)
 
     raise RuntimeError(f"Spotify API {method} {path} failed after retries")
 
@@ -234,14 +246,34 @@ def gather_candidates(sp):
     return tracks
 
 
-def filter_candidates(sp, candidates):
+def filter_candidates(sp, auth_manager, candidates):
     # remove too popular and enforce audio features
     ids = [t["id"] for t in candidates]
     features = []
+    audio_features_forbidden = False
+
     for i in range(0, len(ids), 50):
         batch = ids[i : i + 50]
-        f = spotify_retry(sp.audio_features, batch)
-        features.extend(f)
+        try:
+            res = spotify_api_request(
+                auth_manager,
+                "GET",
+                f"/v1/audio-features?ids={','.join(batch)}",
+            )
+            features.extend(res.get("audio_features", []))
+        except RuntimeError as e:
+            if " 403 " in str(e):
+                audio_features_forbidden = True
+                logger.warning(
+                    "audio-features endpoint returned 403 in this Spotify Dev Mode app; "
+                    "falling back to popularity-only filtering"
+                )
+                break
+            raise
+
+    if audio_features_forbidden:
+        return [t for t in candidates if t.get("popularity", 0) <= MAX_POPULARITY]
+
     filtered = []
     for track, feat in zip(candidates, features):
         if feat is None:
@@ -296,7 +328,7 @@ def main():
 
     candidates = gather_candidates(sp)
     logger.info("found %d raw candidate tracks", len(candidates))
-    candidates = filter_candidates(sp, candidates)
+    candidates = filter_candidates(sp, auth, candidates)
     logger.info("after audio/popularity filtering: %d", len(candidates))
 
     # history
