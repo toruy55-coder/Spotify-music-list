@@ -11,7 +11,7 @@ Spotify プレイリスト更新スクリプトです。
 ## 📦 依存関係
 
 ```sh
-pip install spotipy python-dotenv
+pip install spotipy python-dotenv requests
 ```
 
 ## ⚙ 環境設定
